@@ -4,6 +4,8 @@
 //   - Pull: Download Notion pages as markdown with frontmatter and comments
 //   - Push: Upload markdown back to Notion (erase+replace, not block-by-block)
 //   - Diff: Compare local markdown against live Notion content
+//   - Query: Query databases with filters, returns flattened JSON
+//   - Schema: Get database schema (property names and types)
 //
 // The push operation uses PATCH /pages/{id} with erase_content=true for
 // single-call content clearing, which is dramatically faster than deleting
@@ -12,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -32,6 +35,8 @@ func main() {
 	s.AddTool(pullTool(), handlePull)
 	s.AddTool(pushTool(), handlePush)
 	s.AddTool(diffTool(), handleDiff)
+	s.AddTool(queryTool(), handleQuery)
+	s.AddTool(schemaTool(), handleSchema)
 
 	// Run server
 	if err := server.ServeStdio(s); err != nil {
@@ -137,4 +142,104 @@ func handleDiff(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	}
 
 	return mcp.NewToolResultText(diff), nil
+}
+
+func queryTool() mcp.Tool {
+	return mcp.NewTool("notion_query",
+		mcp.WithDescription("Query a Notion database. Returns flattened JSON with property values extracted (not nested Notion format)."),
+		mcp.WithString("database_id",
+			mcp.Required(),
+			mcp.Description("Notion database ID (with or without dashes)"),
+		),
+		mcp.WithObject("filter",
+			mcp.Description("Notion filter object (e.g., {\"property\": \"Status\", \"status\": {\"equals\": \"Active\"}})"),
+		),
+		mcp.WithArray("sorts",
+			mcp.Description("Array of sort objects (e.g., [{\"property\": \"Name\", \"direction\": \"ascending\"}])"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum results to return (1-100, default 100)"),
+		),
+	)
+}
+
+func handleQuery(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, _ := req.Params.Arguments.(map[string]any)
+	databaseID, _ := args["database_id"].(string)
+
+	if databaseID == "" {
+		return mcp.NewToolResultError("database_id is required"), nil
+	}
+
+	var filter map[string]any
+	if f, ok := args["filter"].(map[string]any); ok {
+		filter = f
+	}
+
+	var sorts []map[string]any
+	if s, ok := args["sorts"].([]any); ok {
+		for _, item := range s {
+			if m, ok := item.(map[string]any); ok {
+				sorts = append(sorts, m)
+			}
+		}
+	}
+
+	limit := 100
+	if l, ok := args["limit"].(float64); ok {
+		limit = int(l)
+	}
+
+	client, err := notion.NewClient()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create client: %v", err)), nil
+	}
+
+	result, err := client.QueryDatabase(databaseID, filter, sorts, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to query database: %v", err)), nil
+	}
+
+	output, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(output)), nil
+}
+
+func schemaTool() mcp.Tool {
+	return mcp.NewTool("notion_schema",
+		mcp.WithDescription("Get the schema of a Notion database (property names and types)."),
+		mcp.WithString("database_id",
+			mcp.Required(),
+			mcp.Description("Notion database ID (with or without dashes)"),
+		),
+	)
+}
+
+func handleSchema(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, _ := req.Params.Arguments.(map[string]any)
+	databaseID, _ := args["database_id"].(string)
+
+	if databaseID == "" {
+		return mcp.NewToolResultError("database_id is required"), nil
+	}
+
+	client, err := notion.NewClient()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to create client: %v", err)), nil
+	}
+
+	schema, err := client.GetSchema(databaseID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get schema: %v", err)), nil
+	}
+
+	output, err := json.MarshalIndent(schema, "", "  ")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal schema: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(string(output)), nil
 }

@@ -569,3 +569,255 @@ func extractCommentsSection(markdown string) (content, comments string) {
 
 	return strings.TrimSpace(markdown[:idx]), strings.TrimSpace(markdown[idx+13:])
 }
+
+// SchemaProperty describes a database property.
+type SchemaProperty struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// QueryResult contains flattened database query results.
+type QueryResult struct {
+	Results    []map[string]any `json:"results"`
+	HasMore    bool             `json:"has_more"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+// GetSchema returns the schema of a database (property names and types).
+func (c *Client) GetSchema(databaseID string) ([]SchemaProperty, error) {
+	databaseID = strings.ReplaceAll(databaseID, "-", "")
+	url := fmt.Sprintf("%s/databases/%s", notionAPIBase, databaseID)
+
+	resp, err := c.doRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Properties map[string]struct {
+			Type string `json:"type"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse schema: %w", err)
+	}
+
+	var schema []SchemaProperty
+	for name, prop := range result.Properties {
+		schema = append(schema, SchemaProperty{
+			Name: name,
+			Type: prop.Type,
+		})
+	}
+
+	return schema, nil
+}
+
+// QueryDatabase queries a database and returns flattened results.
+func (c *Client) QueryDatabase(databaseID string, filter map[string]any, sorts []map[string]any, limit int) (*QueryResult, error) {
+	databaseID = strings.ReplaceAll(databaseID, "-", "")
+
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+
+	body := map[string]any{
+		"page_size": limit,
+	}
+	if filter != nil {
+		body["filter"] = filter
+	}
+	if sorts != nil {
+		body["sorts"] = sorts
+	}
+
+	url := fmt.Sprintf("%s/databases/%s/query", notionAPIBase, databaseID)
+	resp, err := c.doRequest("POST", url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw struct {
+		Results []struct {
+			ID         string                    `json:"id"`
+			Properties map[string]map[string]any `json:"properties"`
+		} `json:"results"`
+		HasMore    bool   `json:"has_more"`
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse query results: %w", err)
+	}
+
+	var results []map[string]any
+	for _, page := range raw.Results {
+		flat := map[string]any{
+			"_id": page.ID,
+		}
+		for name, prop := range page.Properties {
+			flat[name] = c.flattenProperty(prop)
+		}
+		results = append(results, flat)
+	}
+
+	return &QueryResult{
+		Results:    results,
+		HasMore:    raw.HasMore,
+		NextCursor: raw.NextCursor,
+	}, nil
+}
+
+// flattenProperty extracts the value from a Notion property object.
+func (c *Client) flattenProperty(prop map[string]any) any {
+	propType, _ := prop["type"].(string)
+
+	switch propType {
+	case "title":
+		return extractRichText(prop["title"])
+	case "rich_text":
+		return extractRichText(prop["rich_text"])
+	case "number":
+		return prop["number"]
+	case "select":
+		if sel, ok := prop["select"].(map[string]any); ok {
+			return sel["name"]
+		}
+		return nil
+	case "multi_select":
+		if arr, ok := prop["multi_select"].([]any); ok {
+			var names []string
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					if name, ok := m["name"].(string); ok {
+						names = append(names, name)
+					}
+				}
+			}
+			return names
+		}
+		return nil
+	case "status":
+		if status, ok := prop["status"].(map[string]any); ok {
+			return status["name"]
+		}
+		return nil
+	case "date":
+		if date, ok := prop["date"].(map[string]any); ok {
+			start, _ := date["start"].(string)
+			end, _ := date["end"].(string)
+			if end != "" {
+				return map[string]string{"start": start, "end": end}
+			}
+			return start
+		}
+		return nil
+	case "people":
+		if arr, ok := prop["people"].([]any); ok {
+			var names []string
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					if name, ok := m["name"].(string); ok {
+						names = append(names, name)
+					} else if id, ok := m["id"].(string); ok {
+						names = append(names, c.resolveUserName(id))
+					}
+				}
+			}
+			return names
+		}
+		return nil
+	case "checkbox":
+		return prop["checkbox"]
+	case "url":
+		return prop["url"]
+	case "email":
+		return prop["email"]
+	case "phone_number":
+		return prop["phone_number"]
+	case "created_time":
+		return prop["created_time"]
+	case "created_by":
+		if user, ok := prop["created_by"].(map[string]any); ok {
+			if name, ok := user["name"].(string); ok {
+				return name
+			}
+			if id, ok := user["id"].(string); ok {
+				return c.resolveUserName(id)
+			}
+		}
+		return nil
+	case "last_edited_time":
+		return prop["last_edited_time"]
+	case "last_edited_by":
+		if user, ok := prop["last_edited_by"].(map[string]any); ok {
+			if name, ok := user["name"].(string); ok {
+				return name
+			}
+			if id, ok := user["id"].(string); ok {
+				return c.resolveUserName(id)
+			}
+		}
+		return nil
+	case "formula":
+		if formula, ok := prop["formula"].(map[string]any); ok {
+			ftype, _ := formula["type"].(string)
+			return formula[ftype]
+		}
+		return nil
+	case "relation":
+		if arr, ok := prop["relation"].([]any); ok {
+			var ids []string
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					if id, ok := m["id"].(string); ok {
+						ids = append(ids, id)
+					}
+				}
+			}
+			return ids
+		}
+		return nil
+	case "rollup":
+		if rollup, ok := prop["rollup"].(map[string]any); ok {
+			rtype, _ := rollup["type"].(string)
+			return rollup[rtype]
+		}
+		return nil
+	case "files":
+		if arr, ok := prop["files"].([]any); ok {
+			var urls []string
+			for _, item := range arr {
+				if m, ok := item.(map[string]any); ok {
+					if ftype, ok := m["type"].(string); ok {
+						if fileData, ok := m[ftype].(map[string]any); ok {
+							if url, ok := fileData["url"].(string); ok {
+								urls = append(urls, url)
+							}
+						}
+					}
+				}
+			}
+			return urls
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// extractRichText extracts plain text from rich_text array.
+func extractRichText(v any) string {
+	arr, ok := v.([]any)
+	if !ok {
+		return ""
+	}
+	var text strings.Builder
+	for _, item := range arr {
+		if m, ok := item.(map[string]any); ok {
+			if pt, ok := m["plain_text"].(string); ok {
+				text.WriteString(pt)
+			}
+		}
+	}
+	return text.String()
+}
