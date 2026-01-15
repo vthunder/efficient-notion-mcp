@@ -428,7 +428,7 @@ func parseInlineMarkdown(text string) []map[string]any {
 			}
 		}
 
-		// Regular text
+		// Regular text - find next special char or end of string
 		start := i
 		for i < len(text) && text[i] != '*' && text[i] != '`' && text[i] != '[' {
 			i++
@@ -438,6 +438,13 @@ func parseInlineMarkdown(text string) []map[string]any {
 				"type": "text",
 				"text": map[string]string{"content": text[start:i]},
 			})
+		} else {
+			// Special char without valid closing - treat as literal text and advance
+			result = append(result, map[string]any{
+				"type": "text",
+				"text": map[string]string{"content": string(text[i])},
+			})
+			i++
 		}
 	}
 

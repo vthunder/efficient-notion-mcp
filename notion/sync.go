@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,16 @@ import (
 	"strings"
 	"time"
 )
+
+// Debug controls whether debug logging is enabled.
+// Set NOTION_DEBUG=1 to enable.
+var Debug = os.Getenv("NOTION_DEBUG") == "1"
+
+func debugLog(format string, args ...any) {
+	if Debug {
+		log.Printf("[notion] "+format, args...)
+	}
+}
 
 const (
 	notionAPIBase    = "https://api.notion.com/v1"
@@ -139,6 +150,7 @@ func (c *Client) PullPage(pageID string, outputDir string) (*PullResult, error) 
 // PushPage reads a markdown file and pushes to Notion using erase+replace.
 // This is much faster than deleting blocks one by one.
 func (c *Client) PushPage(filePath string) error {
+	debugLog("PushPage: reading %s", filePath)
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
@@ -148,9 +160,11 @@ func (c *Client) PushPage(filePath string) error {
 	if pageID == "" {
 		return fmt.Errorf("no notion_id found in frontmatter")
 	}
+	debugLog("PushPage: page_id=%s, content_len=%d", pageID, len(markdown))
 
 	markdown, preservedComments := extractCommentsSection(markdown)
 	blocks := MarkdownToBlocks(markdown)
+	debugLog("PushPage: converted to %d blocks", len(blocks))
 
 	if preservedComments != "" {
 		blocks = append(blocks, map[string]any{
@@ -171,13 +185,16 @@ func (c *Client) PushPage(filePath string) error {
 	}
 
 	// KEY EFFICIENCY: Single API call to erase all content
+	debugLog("PushPage: erasing page content")
 	if err := c.erasePage(pageID); err != nil {
 		return fmt.Errorf("failed to erase page: %w", err)
 	}
+	debugLog("PushPage: erase complete, appending %d blocks", len(blocks))
 
 	if err := c.appendBlocksBatched(pageID, blocks); err != nil {
 		return fmt.Errorf("failed to append blocks: %w", err)
 	}
+	debugLog("PushPage: complete")
 
 	return nil
 }
@@ -459,22 +476,26 @@ func (c *Client) erasePage(pageID string) error {
 // appendBlocksBatched appends blocks in batches of 100.
 func (c *Client) appendBlocksBatched(pageID string, blocks []map[string]any) error {
 	const batchSize = 100
+	totalBatches := (len(blocks) + batchSize - 1) / batchSize
 
 	for i := 0; i < len(blocks); i += batchSize {
 		end := i + batchSize
 		if end > len(blocks) {
 			end = len(blocks)
 		}
+		batchNum := i/batchSize + 1
 
 		batch := blocks[i:end]
 		body := map[string]any{
 			"children": batch,
 		}
 
+		debugLog("appendBlocksBatched: sending batch %d/%d (%d blocks)", batchNum, totalBatches, len(batch))
 		url := fmt.Sprintf("%s/blocks/%s/children", notionAPIBase, pageID)
 		if _, err := c.doRequest("PATCH", url, body); err != nil {
 			return fmt.Errorf("failed to append batch %d: %w", i/batchSize, err)
 		}
+		debugLog("appendBlocksBatched: batch %d complete", batchNum)
 
 		if end < len(blocks) {
 			time.Sleep(100 * time.Millisecond)
@@ -487,13 +508,18 @@ func (c *Client) appendBlocksBatched(pageID string, blocks []map[string]any) err
 // doRequest makes an authenticated request to Notion API.
 func (c *Client) doRequest(method, url string, body any) ([]byte, error) {
 	var bodyReader io.Reader
+	var bodyLen int
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal body: %w", err)
 		}
+		bodyLen = len(data)
 		bodyReader = bytes.NewReader(data)
 	}
+
+	debugLog("doRequest: %s %s (body: %d bytes)", method, url, bodyLen)
+	start := time.Now()
 
 	req, err := http.NewRequest(method, url, bodyReader)
 	if err != nil {
@@ -506,6 +532,7 @@ func (c *Client) doRequest(method, url string, body any) ([]byte, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		debugLog("doRequest: failed after %v: %v", time.Since(start), err)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -514,6 +541,8 @@ func (c *Client) doRequest(method, url string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
+
+	debugLog("doRequest: %d (%d bytes) in %v", resp.StatusCode, len(respBody), time.Since(start))
 
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
