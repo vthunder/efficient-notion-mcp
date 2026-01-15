@@ -63,6 +63,34 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 			continue
 		}
 
+		// Code block (fenced with ```)
+		if len(line) >= 3 && line[0:3] == "```" {
+			lang := strings.TrimSpace(line[3:])
+			var codeLines []string
+			// Collect lines until closing ```
+			for i+1 < len(lines) {
+				i++
+				if len(lines[i]) >= 3 && lines[i][0:3] == "```" {
+					break
+				}
+				codeLines = append(codeLines, lines[i])
+			}
+			codeContent := strings.Join(codeLines, "\n")
+			// Map common language aliases to Notion's expected values
+			notionLang := mapLanguageToNotion(lang)
+			blocks = append(blocks, map[string]any{
+				"object": "block",
+				"type":   "code",
+				"code": map[string]any{
+					"rich_text": []map[string]any{
+						{"type": "text", "text": map[string]string{"content": codeContent}},
+					},
+					"language": notionLang,
+				},
+			})
+			continue
+		}
+
 		// Checkbox (to_do)
 		if len(line) > 5 && (line[0:5] == "- [ ]" || line[0:5] == "- [x]") {
 			checked := line[3] == 'x'
@@ -564,4 +592,62 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+// mapLanguageToNotion maps markdown language hints to Notion's expected language values.
+// Notion has a specific list of supported languages.
+func mapLanguageToNotion(lang string) string {
+	lang = strings.ToLower(strings.TrimSpace(lang))
+	if lang == "" {
+		return "plain text"
+	}
+
+	// Map common aliases to Notion's expected values
+	languageMap := map[string]string{
+		"plaintext":  "plain text",
+		"plain":      "plain text",
+		"text":       "plain text",
+		"txt":        "plain text",
+		"js":         "javascript",
+		"ts":         "typescript",
+		"py":         "python",
+		"rb":         "ruby",
+		"sh":         "shell",
+		"bash":       "shell",
+		"zsh":        "shell",
+		"yml":        "yaml",
+		"dockerfile": "docker",
+		"md":         "markdown",
+	}
+
+	if mapped, ok := languageMap[lang]; ok {
+		return mapped
+	}
+
+	// Return as-is if it's a known Notion language
+	knownLanguages := map[string]bool{
+		"abap": true, "arduino": true, "assembly": true, "bash": true,
+		"c": true, "c#": true, "c++": true, "clojure": true, "coffeescript": true,
+		"css": true, "dart": true, "diff": true, "docker": true, "elixir": true,
+		"elm": true, "erlang": true, "flow": true, "fortran": true, "f#": true,
+		"gherkin": true, "glsl": true, "go": true, "graphql": true, "groovy": true,
+		"haskell": true, "html": true, "java": true, "javascript": true, "json": true,
+		"julia": true, "kotlin": true, "latex": true, "less": true, "lisp": true,
+		"livescript": true, "lua": true, "makefile": true, "markdown": true,
+		"markup": true, "matlab": true, "mermaid": true, "nix": true,
+		"objective-c": true, "ocaml": true, "pascal": true, "perl": true,
+		"php": true, "plain text": true, "powershell": true, "prolog": true,
+		"protobuf": true, "python": true, "r": true, "reason": true, "ruby": true,
+		"rust": true, "sass": true, "scala": true, "scheme": true, "scss": true,
+		"shell": true, "sql": true, "swift": true, "typescript": true,
+		"vb.net": true, "verilog": true, "vhdl": true, "visual basic": true,
+		"webassembly": true, "xml": true, "yaml": true, "java/c/c++/c#": true,
+	}
+
+	if knownLanguages[lang] {
+		return lang
+	}
+
+	// Default to plain text for unknown languages
+	return "plain text"
 }
