@@ -271,18 +271,6 @@ func (c *Client) fetchAllBlocks(blockID string) ([]map[string]any, error) {
 				continue
 			}
 
-			if comments, err := c.fetchComments(blockID); err == nil && len(comments) > 0 {
-				var commentsData []map[string]any
-				for _, comment := range comments {
-					commentsData = append(commentsData, map[string]any{
-						"author":     comment.Author,
-						"content":    comment.Content,
-						"created_at": comment.CreatedAt.Format("Jan 2, 2006"),
-					})
-				}
-				result.Results[i]["_comments"] = commentsData
-			}
-
 			hasChildren, _ := block["has_children"].(bool)
 			if hasChildren {
 				children, err := c.fetchBlockChildren(blockID)
@@ -330,25 +318,6 @@ func (c *Client) fetchBlockChildren(blockID string) ([]any, error) {
 		}
 		if err := json.Unmarshal(resp, &result); err != nil {
 			return nil, err
-		}
-
-		for i, child := range result.Results {
-			childID, _ := child["id"].(string)
-			if childID == "" {
-				continue
-			}
-
-			if comments, err := c.fetchComments(childID); err == nil && len(comments) > 0 {
-				var commentsData []map[string]any
-				for _, comment := range comments {
-					commentsData = append(commentsData, map[string]any{
-						"author":     comment.Author,
-						"content":    comment.Content,
-						"created_at": comment.CreatedAt.Format("Jan 2, 2006"),
-					})
-				}
-				result.Results[i]["_comments"] = commentsData
-			}
 		}
 
 		for _, r := range result.Results {
