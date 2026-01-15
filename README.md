@@ -1,12 +1,18 @@
 # efficient-notion-mcp
 
-An MCP (Model Context Protocol) server providing efficient bidirectional sync between Notion pages and local markdown files.
+An MCP (Model Context Protocol) server for efficient Notion operations:
+- **Page sync**: Bidirectional sync between Notion pages and local markdown files
+- **Database queries**: Query databases with filters, get flattened JSON (not Notion's verbose nested format)
 
 ## Why This Exists
 
-The official Notion MCP tools work well for reading and small edits, but updating entire pages is painfully slow. When you need to push changes back to Notion, the naive approach deletes blocks one-by-one, making N API calls for N blocks. On a page with 50 blocks, that's 50 sequential API calls just to clear the content before you can write new content.
+The official Notion MCP tools work well for reading and small edits, but:
+1. **Page updates are slow** - the naive approach deletes blocks one-by-one, making N API calls for N blocks
+2. **Query results are verbose** - Notion's nested property format is hard to work with
 
-This server uses **efficient bulk operations** that make page updates dramatically faster.
+This server provides:
+- **Bulk operations** that make page updates 25x faster
+- **Flattened JSON** for database queries - simple `{"Name": "Task", "Status": "Done"}` instead of deeply nested objects
 
 ## Key Efficiency Techniques
 
@@ -40,7 +46,21 @@ PATCH /blocks/{page_id}/children
 
 Comment author names are resolved once and cached, avoiding repeated `/users/{id}` calls when the same user has multiple comments.
 
-### 4. Markdown Round-Trip
+### 4. Flattened Database Queries
+
+Notion's API returns verbose nested property objects:
+```json
+{"Name": {"title": [{"plain_text": "Task 1"}]}, "Status": {"status": {"name": "Done"}}}
+```
+
+We flatten this to simple key-value pairs:
+```json
+{"Name": "Task 1", "Status": "Done"}
+```
+
+All property types are handled: title, rich_text, select, multi_select, status, date, people, checkbox, formula, relation, rollup, and more.
+
+### 5. Markdown Round-Trip
 
 Pages are converted to markdown for local editing, preserving:
 - Headings, paragraphs, lists (bullet, numbered, checkbox)
@@ -134,6 +154,62 @@ Compare local markdown against live Notion content.
 ```
 notion_diff("/tmp/notion/My-Page.md")
 → Shows added/removed lines
+```
+
+### `notion_query`
+
+Query a Notion database with filters and sorts. Returns **flattened JSON** - property values are extracted from Notion's verbose nested format into simple key-value pairs.
+
+**Parameters:**
+- `database_id` (required): Notion database ID (with or without dashes)
+- `filter` (optional): Notion filter object
+- `sorts` (optional): Array of sort objects
+- `limit` (optional): Max results 1-100 (default: 100)
+
+**Example:**
+```
+notion_query(
+  database_id="15ae67c666dd8073b484d1b4ccee3080",
+  filter={"property": "Status", "status": {"equals": "Active"}},
+  sorts=[{"property": "Priority", "direction": "ascending"}],
+  limit=50
+)
+```
+
+**Response:**
+```json
+{
+  "results": [
+    {"_id": "abc123", "Name": "Task 1", "Status": "Active", "Priority": "P0"},
+    {"_id": "def456", "Name": "Task 2", "Status": "Active", "Priority": "P1"}
+  ],
+  "has_more": false,
+  "next_cursor": ""
+}
+```
+
+**Supported property types:** title, rich_text, number, select, multi_select, status, date, people, checkbox, url, email, phone_number, created_time, created_by, last_edited_time, last_edited_by, formula, relation, rollup, files.
+
+### `notion_schema`
+
+Get the schema of a Notion database (property names and types).
+
+**Parameters:**
+- `database_id` (required): Notion database ID (with or without dashes)
+
+**Example:**
+```
+notion_schema("15ae67c666dd8073b484d1b4ccee3080")
+```
+
+**Response:**
+```json
+[
+  {"name": "Name", "type": "title"},
+  {"name": "Status", "type": "status"},
+  {"name": "Priority", "type": "select"},
+  {"name": "Due Date", "type": "date"}
+]
 ```
 
 ## Markdown Format
