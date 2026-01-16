@@ -149,6 +149,7 @@ func (c *Client) PullPage(pageID string, outputDir string) (*PullResult, error) 
 
 // PushPage reads a markdown file and pushes to Notion using erase+replace.
 // This is much faster than deleting blocks one by one.
+// Child pages are preserved by restoring them from trash after the erase.
 func (c *Client) PushPage(filePath string) error {
 	debugLog("PushPage: reading %s", filePath)
 	content, err := os.ReadFile(filePath)
@@ -184,6 +185,16 @@ func (c *Client) PushPage(filePath string) error {
 		blocks = append(blocks, MarkdownToBlocks(preservedComments)...)
 	}
 
+	// CHILD PAGE PRESERVATION: Get child page IDs before erasing
+	childPageIDs, err := c.getChildPageIDs(pageID)
+	if err != nil {
+		debugLog("PushPage: warning: failed to get child pages: %v", err)
+		// Continue anyway - child pages may not exist
+	}
+	if len(childPageIDs) > 0 {
+		debugLog("PushPage: found %d child pages to preserve", len(childPageIDs))
+	}
+
 	// KEY EFFICIENCY: Single API call to erase all content
 	debugLog("PushPage: erasing page content")
 	if err := c.erasePage(pageID); err != nil {
@@ -194,6 +205,15 @@ func (c *Client) PushPage(filePath string) error {
 	if err := c.appendBlocksBatched(pageID, blocks); err != nil {
 		return fmt.Errorf("failed to append blocks: %w", err)
 	}
+
+	// CHILD PAGE PRESERVATION: Restore child pages from trash
+	if len(childPageIDs) > 0 {
+		debugLog("PushPage: restoring %d child pages from trash", len(childPageIDs))
+		if err := c.restorePages(childPageIDs); err != nil {
+			return fmt.Errorf("failed to restore child pages: %w", err)
+		}
+	}
+
 	debugLog("PushPage: complete")
 
 	return nil
@@ -471,6 +491,71 @@ func (c *Client) erasePage(pageID string) error {
 	}
 	_, err := c.doRequest("PATCH", url, body)
 	return err
+}
+
+// getChildPageIDs returns the page IDs of all child_page blocks in a page.
+// This is a bulk operation (one API call per 100 blocks), not block-by-block.
+func (c *Client) getChildPageIDs(pageID string) ([]string, error) {
+	var childPageIDs []string
+	cursor := ""
+
+	for {
+		url := fmt.Sprintf("%s/blocks/%s/children?page_size=100", notionAPIBase, pageID)
+		if cursor != "" {
+			url += "&start_cursor=" + cursor
+		}
+
+		resp, err := c.doRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var result struct {
+			Results    []map[string]any `json:"results"`
+			HasMore    bool             `json:"has_more"`
+			NextCursor string           `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(resp, &result); err != nil {
+			return nil, fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		for _, block := range result.Results {
+			blockType, _ := block["type"].(string)
+			if blockType == "child_page" {
+				if childPage, ok := block["child_page"].(map[string]any); ok {
+					if title, ok := childPage["title"].(string); ok {
+						// The block ID is the child page ID for child_page blocks
+						if blockID, ok := block["id"].(string); ok {
+							debugLog("getChildPageIDs: found child page %q with ID %s", title, blockID)
+							childPageIDs = append(childPageIDs, blockID)
+						}
+					}
+				}
+			}
+		}
+
+		if !result.HasMore {
+			break
+		}
+		cursor = result.NextCursor
+	}
+
+	return childPageIDs, nil
+}
+
+// restorePages restores pages from trash by setting archived=false.
+func (c *Client) restorePages(pageIDs []string) error {
+	for _, pageID := range pageIDs {
+		debugLog("restorePages: restoring page %s from trash", pageID)
+		url := fmt.Sprintf("%s/pages/%s", notionAPIBase, pageID)
+		body := map[string]any{
+			"archived": false,
+		}
+		if _, err := c.doRequest("PATCH", url, body); err != nil {
+			return fmt.Errorf("failed to restore page %s: %w", pageID, err)
+		}
+	}
+	return nil
 }
 
 // appendBlocksBatched appends blocks in batches of 100.
