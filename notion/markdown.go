@@ -238,6 +238,22 @@ func BlocksToMarkdown(blocks []map[string]any) string {
 			result.WriteString("```" + lang + "\n" + text + "\n```\n\n")
 		case "divider":
 			result.WriteString("---\n\n")
+		case "child_page":
+			// Handle included/linked child pages
+			if childPage, ok := b["child_page"].(map[string]any); ok {
+				title, _ := childPage["title"].(string)
+				if title == "" {
+					title = "Untitled"
+				}
+				// Get the page ID from the block itself
+				pageID, _ := b["id"].(string)
+				if pageID != "" {
+					// Format as page mention to preserve round-trip
+					result.WriteString(fmt.Sprintf("[@%s](notion://%s)\n\n", title, pageID))
+				} else {
+					result.WriteString(fmt.Sprintf("**%s** (child page)\n\n", title))
+				}
+			}
 		case "table":
 			result.WriteString(extractTableMarkdown(b) + "\n")
 			if tableComments := extractTableComments(b); tableComments != "" {
@@ -319,17 +335,95 @@ func extractBlockText(b map[string]any, blockType string) string {
 		}
 	}
 
+	return richTextToMarkdown(richText)
+}
+
+// richTextToMarkdown converts Notion rich_text array to markdown string,
+// preserving formatting, links, and mentions.
+func richTextToMarkdown(richText []any) string {
 	var text strings.Builder
 	for _, item := range richText {
-		if rt, ok := item.(map[string]any); ok {
-			if pt, ok := rt["plain_text"].(string); ok {
-				text.WriteString(pt)
-			} else if textObj, ok := rt["text"].(map[string]any); ok {
-				if content, ok := textObj["content"].(string); ok {
-					text.WriteString(content)
+		rt, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		itemType, _ := rt["type"].(string)
+		content := ""
+		var linkURL string
+
+		switch itemType {
+		case "text":
+			if textObj, ok := rt["text"].(map[string]any); ok {
+				content, _ = textObj["content"].(string)
+				// Check for link
+				if link, ok := textObj["link"].(map[string]any); ok {
+					linkURL, _ = link["url"].(string)
 				}
 			}
+		case "mention":
+			if mention, ok := rt["mention"].(map[string]any); ok {
+				mentionType, _ := mention["type"].(string)
+				switch mentionType {
+				case "page":
+					if page, ok := mention["page"].(map[string]any); ok {
+						pageID, _ := page["id"].(string)
+						plainText, _ := rt["plain_text"].(string)
+						if plainText == "" {
+							plainText = "Page"
+						}
+						// Format as Notion page mention: [@Page Title](notion://page-id)
+						text.WriteString(fmt.Sprintf("[@%s](notion://%s)", plainText, pageID))
+						continue
+					}
+				case "user":
+					plainText, _ := rt["plain_text"].(string)
+					text.WriteString(plainText)
+					continue
+				case "date":
+					plainText, _ := rt["plain_text"].(string)
+					text.WriteString(plainText)
+					continue
+				default:
+					plainText, _ := rt["plain_text"].(string)
+					text.WriteString(plainText)
+					continue
+				}
+			}
+			// Fallback to plain_text
+			if pt, ok := rt["plain_text"].(string); ok {
+				content = pt
+			}
+		default:
+			// Fallback to plain_text for unknown types
+			if pt, ok := rt["plain_text"].(string); ok {
+				content = pt
+			}
 		}
+
+		// Apply annotations (bold, italic, strikethrough, underline, code)
+		if annotations, ok := rt["annotations"].(map[string]any); ok {
+			if code, _ := annotations["code"].(bool); code {
+				content = "`" + content + "`"
+			}
+			if bold, _ := annotations["bold"].(bool); bold {
+				content = "**" + content + "**"
+			}
+			if italic, _ := annotations["italic"].(bool); italic {
+				content = "*" + content + "*"
+			}
+			if strikethrough, _ := annotations["strikethrough"].(bool); strikethrough {
+				content = "~~" + content + "~~"
+			}
+			// Note: underline has no standard markdown equivalent
+		}
+
+		// Apply link if present
+		if linkURL != "" {
+			content = "[" + content + "](" + linkURL + ")"
+		}
+
+		text.WriteString(content)
 	}
 	return text.String()
 }
@@ -353,15 +447,8 @@ func extractTableMarkdown(b map[string]any) string {
 					var rowCells []string
 					for _, cell := range cells {
 						if cellItems, ok := cell.([]any); ok {
-							var cellText strings.Builder
-							for _, item := range cellItems {
-								if rt, ok := item.(map[string]any); ok {
-									if pt, ok := rt["plain_text"].(string); ok {
-										cellText.WriteString(pt)
-									}
-								}
-							}
-							rowCells = append(rowCells, cellText.String())
+							// Use richTextToMarkdown to preserve formatting in table cells
+							rowCells = append(rowCells, richTextToMarkdown(cellItems))
 						}
 					}
 					rows = append(rows, rowCells)
@@ -435,7 +522,7 @@ func parseInlineMarkdown(text string) []map[string]any {
 			}
 		}
 
-		// Link: [text](url)
+		// Link: [text](url) or page mention: [@Title](notion://page-id)
 		if text[i] == '[' {
 			closeBracket := findClosingSingle(text, i+1, ']')
 			if closeBracket > 0 && closeBracket+1 < len(text) && text[closeBracket+1] == '(' {
@@ -443,6 +530,24 @@ func parseInlineMarkdown(text string) []map[string]any {
 				if closeParen > 0 {
 					linkText := text[i+1 : closeBracket]
 					linkURL := text[closeBracket+2 : closeParen]
+
+					// Check for page mention: [@Title](notion://page-id)
+					if strings.HasPrefix(linkURL, "notion://") && strings.HasPrefix(linkText, "@") {
+						pageID := strings.TrimPrefix(linkURL, "notion://")
+						result = append(result, map[string]any{
+							"type": "mention",
+							"mention": map[string]any{
+								"type": "page",
+								"page": map[string]any{
+									"id": pageID,
+								},
+							},
+						})
+						i = closeParen + 1
+						continue
+					}
+
+					// Regular link
 					result = append(result, map[string]any{
 						"type": "text",
 						"text": map[string]any{
