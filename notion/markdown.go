@@ -190,7 +190,16 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 }
 
 // BlocksToMarkdown converts Notion API block results to markdown.
+// This is the legacy function - use BlocksToMarkdownWithChildPages for proper child page handling.
 func BlocksToMarkdown(blocks []map[string]any) string {
+	return BlocksToMarkdownWithChildPages(blocks, nil)
+}
+
+// BlocksToMarkdownWithChildPages converts Notion API block results to markdown.
+// Child pages that are not trailing become mentions [@Title](notion://ID).
+// Trailing child pages (those after the last real content) are skipped entirely
+// since they'll be restored at the bottom anyway.
+func BlocksToMarkdownWithChildPages(blocks []map[string]any, trailingChildPages map[string]bool) string {
 	var result strings.Builder
 	listNum := 1
 	lastType := ""
@@ -244,18 +253,23 @@ func BlocksToMarkdown(blocks []map[string]any) string {
 		case "divider":
 			result.WriteString("---\n\n")
 		case "child_page":
-			// Handle child pages - output as comment marker, not content
-			// Child pages are restored from trash after push, so we don't include them in markdown
-			// The comment marker preserves position info for potential future use
-			if childPage, ok := b["child_page"].(map[string]any); ok {
-				title, _ := childPage["title"].(string)
-				if title == "" {
-					title = "Untitled"
+			// Handle child pages as mentions (links to the page)
+			// Trailing child pages are skipped - they'll be at the bottom after restore anyway
+			pageID, _ := b["id"].(string)
+			if pageID != "" {
+				// Skip trailing child pages entirely
+				if trailingChildPages != nil && trailingChildPages[pageID] {
+					// Don't output anything - will be restored at bottom
+					continue
 				}
-				pageID, _ := b["id"].(string)
-				if pageID != "" {
-					// Use HTML comment - will be stripped during push, child page restored separately
-					result.WriteString(fmt.Sprintf("<!-- child_page: %s | %s -->\n\n", pageID, title))
+				// Non-trailing: output as mention link
+				if childPage, ok := b["child_page"].(map[string]any); ok {
+					title, _ := childPage["title"].(string)
+					if title == "" {
+						title = "Untitled"
+					}
+					// Output as mention: [@Title](notion://page-id)
+					result.WriteString(fmt.Sprintf("[@%s](notion://%s)\n\n", title, pageID))
 				}
 			}
 		case "table":
