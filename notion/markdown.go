@@ -17,6 +17,11 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 			continue
 		}
 
+		// Skip child_page comment markers - these are placeholders, actual child pages are restored separately
+		if strings.HasPrefix(line, "<!-- child_page:") && strings.HasSuffix(line, "-->") {
+			continue
+		}
+
 		// Heading 1
 		if len(line) > 2 && line[0] == '#' && line[1] == ' ' {
 			blocks = append(blocks, map[string]any{
@@ -239,19 +244,18 @@ func BlocksToMarkdown(blocks []map[string]any) string {
 		case "divider":
 			result.WriteString("---\n\n")
 		case "child_page":
-			// Handle included/linked child pages
+			// Handle child pages - output as comment marker, not content
+			// Child pages are restored from trash after push, so we don't include them in markdown
+			// The comment marker preserves position info for potential future use
 			if childPage, ok := b["child_page"].(map[string]any); ok {
 				title, _ := childPage["title"].(string)
 				if title == "" {
 					title = "Untitled"
 				}
-				// Get the page ID from the block itself
 				pageID, _ := b["id"].(string)
 				if pageID != "" {
-					// Format as page mention to preserve round-trip
-					result.WriteString(fmt.Sprintf("[@%s](notion://%s)\n\n", title, pageID))
-				} else {
-					result.WriteString(fmt.Sprintf("**%s** (child page)\n\n", title))
+					// Use HTML comment - will be stripped during push, child page restored separately
+					result.WriteString(fmt.Sprintf("<!-- child_page: %s | %s -->\n\n", pageID, title))
 				}
 			}
 		case "table":
