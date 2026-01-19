@@ -7,14 +7,36 @@ import (
 
 // MarkdownToBlocks converts markdown text to Notion block structures.
 func MarkdownToBlocks(markdown string) []map[string]any {
-	var blocks []map[string]any
 	lines := splitLines(markdown)
+	blocks, _ := parseBlocksWithIndent(lines, 0, 0)
+	return blocks
+}
 
-	for i := 0; i < len(lines); i++ {
+// parseBlocksWithIndent parses lines starting at startIdx with the given minimum indent level.
+// Returns the parsed blocks and the next line index to process.
+func parseBlocksWithIndent(lines []string, startIdx int, minIndent int) ([]map[string]any, int) {
+	var blocks []map[string]any
+
+	for i := startIdx; i < len(lines); i++ {
 		line := lines[i]
 
-		if line == "" {
+		// Skip empty lines
+		if strings.TrimSpace(line) == "" {
 			continue
+		}
+
+		// Check indent level
+		indent := getIndentLevel(line)
+		if indent < minIndent {
+			// Back to parent level, return
+			return blocks, i
+		}
+
+		// Remove the minimum indent from the line for processing
+		if indent >= minIndent && minIndent > 0 {
+			if len(line) >= minIndent {
+				line = line[minIndent:]
+			}
 		}
 
 		// Skip child_page comment markers - these are placeholders, actual child pages are restored separately
@@ -116,13 +138,23 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 
 		// Bullet list
 		if len(line) > 2 && line[0:2] == "- " {
-			blocks = append(blocks, map[string]any{
+			block := map[string]any{
 				"object": "block",
 				"type":   "bulleted_list_item",
 				"bulleted_list_item": map[string]any{
 					"rich_text": parseInlineMarkdown(line[2:]),
 				},
-			})
+			}
+			// Check for indented children - children go at block level for Notion API
+			childIndent := indent + minIndent + 2 // At least 2 more spaces for children
+			if i+1 < len(lines) {
+				children, nextIdx := parseBlocksWithIndent(lines, i+1, childIndent)
+				if len(children) > 0 {
+					block["children"] = children
+				}
+				i = nextIdx - 1 // -1 because loop will i++
+			}
+			blocks = append(blocks, block)
 			continue
 		}
 
@@ -139,13 +171,23 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 				}
 			}
 			if dotIdx > 0 {
-				blocks = append(blocks, map[string]any{
+				block := map[string]any{
 					"object": "block",
 					"type":   "numbered_list_item",
 					"numbered_list_item": map[string]any{
 						"rich_text": parseInlineMarkdown(line[dotIdx+2:]),
 					},
-				})
+				}
+				// Check for indented children - children go at block level for Notion API
+				childIndent := indent + minIndent + 3 // At least 3 more spaces for children (to align with text after "1. ")
+				if i+1 < len(lines) {
+					children, nextIdx := parseBlocksWithIndent(lines, i+1, childIndent)
+					if len(children) > 0 {
+						block["children"] = children
+					}
+					i = nextIdx - 1 // -1 because loop will i++
+				}
+				blocks = append(blocks, block)
 				continue
 			}
 		}
@@ -186,7 +228,75 @@ func MarkdownToBlocks(markdown string) []map[string]any {
 		})
 	}
 
-	return blocks
+	return blocks, len(lines)
+}
+
+// getIndentLevel returns the number of leading spaces/tabs in a line.
+// Tabs are counted as 4 spaces.
+func getIndentLevel(line string) int {
+	indent := 0
+	for _, c := range line {
+		if c == ' ' {
+			indent++
+		} else if c == '\t' {
+			indent += 4
+		} else {
+			break
+		}
+	}
+	return indent
+}
+
+// extractChildBlocksFromBlock extracts children blocks from a block.
+// Checks both block level (for local creation) and content level (from API fetch).
+// Handles both []any (from API) and []map[string]any (from local creation).
+func extractChildBlocksFromBlock(block map[string]any, blockType string) []map[string]any {
+	// First check block level (for locally created blocks and Notion API write format)
+	if children := extractChildrenFromMap(block); len(children) > 0 {
+		return children
+	}
+	// Then check content level (for blocks fetched from Notion API)
+	if content, ok := block[blockType].(map[string]any); ok {
+		return extractChildrenFromMap(content)
+	}
+	return nil
+}
+
+// extractChildrenFromMap extracts children array from a map, handling type variations.
+func extractChildrenFromMap(m map[string]any) []map[string]any {
+	if children, ok := m["children"].([]any); ok {
+		var blocks []map[string]any
+		for _, child := range children {
+			if block, ok := child.(map[string]any); ok {
+				blocks = append(blocks, block)
+			}
+		}
+		return blocks
+	}
+	if children, ok := m["children"].([]map[string]any); ok {
+		return children
+	}
+	return nil
+}
+
+// blocksToMarkdownIndented converts blocks to markdown with each line indented.
+func blocksToMarkdownIndented(blocks []map[string]any, indent string, trailingChildPages map[string]bool) string {
+	md := BlocksToMarkdownWithChildPages(blocks, trailingChildPages)
+	if md == "" {
+		return ""
+	}
+	// Indent each line
+	lines := strings.Split(md, "\n")
+	var result strings.Builder
+	for i, line := range lines {
+		if line != "" {
+			result.WriteString(indent + line)
+		}
+		if i < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+	return result.String()
 }
 
 // BlocksToMarkdown converts Notion API block results to markdown.
@@ -227,9 +337,21 @@ func BlocksToMarkdownWithChildPages(blocks []map[string]any, trailingChildPages 
 			result.WriteString(text + "\n\n")
 		case "bulleted_list_item":
 			result.WriteString("- " + text + "\n")
+			// Handle children (checks both block level and content level)
+			childBlocks := extractChildBlocksFromBlock(b, "bulleted_list_item")
+			if len(childBlocks) > 0 {
+				childMd := blocksToMarkdownIndented(childBlocks, "  ", trailingChildPages)
+				result.WriteString(childMd)
+			}
 		case "numbered_list_item":
 			result.WriteString(fmt.Sprintf("%d. %s\n", listNum, text))
 			listNum++
+			// Handle children (checks both block level and content level)
+			childBlocks := extractChildBlocksFromBlock(b, "numbered_list_item")
+			if len(childBlocks) > 0 {
+				childMd := blocksToMarkdownIndented(childBlocks, "   ", trailingChildPages)
+				result.WriteString(childMd)
+			}
 		case "to_do":
 			check := " "
 			if todoBlock, ok := b["to_do"].(map[string]any); ok {
@@ -348,8 +470,15 @@ func extractBlockText(b map[string]any, blockType string) string {
 	var richText []any
 
 	if content, ok := b[blockType].(map[string]any); ok {
+		// Handle both []any (from API) and []map[string]any (from local creation)
 		if rt, ok := content["rich_text"].([]any); ok {
 			richText = rt
+		} else if rtMaps, ok := content["rich_text"].([]map[string]any); ok {
+			// Convert []map[string]any to []any
+			richText = make([]any, len(rtMaps))
+			for i, m := range rtMaps {
+				richText[i] = m
+			}
 		}
 	}
 
@@ -372,11 +501,16 @@ func richTextToMarkdown(richText []any) string {
 
 		switch itemType {
 		case "text":
+			// Handle both map[string]any (from API) and map[string]string (from local creation)
 			if textObj, ok := rt["text"].(map[string]any); ok {
 				content, _ = textObj["content"].(string)
-				// Check for link
 				if link, ok := textObj["link"].(map[string]any); ok {
 					linkURL, _ = link["url"].(string)
+				}
+			} else if textObj, ok := rt["text"].(map[string]string); ok {
+				content = textObj["content"]
+				if link, ok := textObj["link"]; ok {
+					linkURL = link
 				}
 			}
 		case "mention":
@@ -420,20 +554,30 @@ func richTextToMarkdown(richText []any) string {
 		}
 
 		// Apply annotations (bold, italic, strikethrough, underline, code)
+		// Handle both map[string]any (from API) and map[string]bool (from local creation)
+		var code, bold, italic, strikethrough bool
 		if annotations, ok := rt["annotations"].(map[string]any); ok {
-			if code, _ := annotations["code"].(bool); code {
-				content = "`" + content + "`"
-			}
-			if bold, _ := annotations["bold"].(bool); bold {
-				content = "**" + content + "**"
-			}
-			if italic, _ := annotations["italic"].(bool); italic {
-				content = "*" + content + "*"
-			}
-			if strikethrough, _ := annotations["strikethrough"].(bool); strikethrough {
-				content = "~~" + content + "~~"
-			}
-			// Note: underline has no standard markdown equivalent
+			code, _ = annotations["code"].(bool)
+			bold, _ = annotations["bold"].(bool)
+			italic, _ = annotations["italic"].(bool)
+			strikethrough, _ = annotations["strikethrough"].(bool)
+		} else if annotations, ok := rt["annotations"].(map[string]bool); ok {
+			code = annotations["code"]
+			bold = annotations["bold"]
+			italic = annotations["italic"]
+			strikethrough = annotations["strikethrough"]
+		}
+		if code {
+			content = "`" + content + "`"
+		}
+		if bold {
+			content = "**" + content + "**"
+		}
+		if italic {
+			content = "*" + content + "*"
+		}
+		if strikethrough {
+			content = "~~" + content + "~~"
 		}
 
 		// Apply link if present
