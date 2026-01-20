@@ -47,13 +47,19 @@ func main() {
 
 func pullTool() mcp.Tool {
 	return mcp.NewTool("notion_pull",
-		mcp.WithDescription("Pull a Notion page to a local markdown file. Fetches all blocks and comments, converts to markdown with frontmatter."),
+		mcp.WithDescription("Pull a Notion page to a local markdown file. Fetches all blocks and comments, converts to markdown with frontmatter. If scope is provided, rewrites notion:// links to relative paths where local copies exist, and updates other files in scope that reference this page."),
 		mcp.WithString("page_id",
 			mcp.Required(),
 			mcp.Description("Notion page ID (with or without dashes)"),
 		),
 		mcp.WithString("output_dir",
 			mcp.Description("Directory to save the markdown file. Default: /tmp/notion"),
+		),
+		mcp.WithString("scope",
+			mcp.Description("Directory to scan for .md files with notion_id frontmatter. If provided, enables link rewriting between local files."),
+		),
+		mcp.WithBoolean("recursive",
+			mcp.Description("Whether to scan scope directory recursively. Default: true"),
 		),
 	)
 }
@@ -62,6 +68,11 @@ func handlePull(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	args, _ := req.Params.Arguments.(map[string]any)
 	pageID, _ := args["page_id"].(string)
 	outputDir, _ := args["output_dir"].(string)
+	scope, _ := args["scope"].(string)
+	recursive := true // default
+	if r, ok := args["recursive"].(bool); ok {
+		recursive = r
+	}
 
 	if pageID == "" {
 		return mcp.NewToolResultError("page_id is required"), nil
@@ -72,23 +83,34 @@ func handlePull(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 		return mcp.NewToolResultError(fmt.Sprintf("failed to create client: %v", err)), nil
 	}
 
-	result, err := client.PullPage(pageID, outputDir)
+	result, err := client.PullPageWithScope(pageID, outputDir, scope, recursive)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to pull page: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf(
+	msg := fmt.Sprintf(
 		"Pulled page '%s' to %s\n\nPage ID: %s\nContent length: %d characters",
 		result.Title, result.FilePath, result.PageID, len(result.Markdown),
-	)), nil
+	)
+	if result.RewrittenLinks > 0 || result.FilesUpdated > 0 {
+		msg += fmt.Sprintf("\nLinks rewritten: %d\nOther files updated: %d", result.RewrittenLinks, result.FilesUpdated)
+	}
+
+	return mcp.NewToolResultText(msg), nil
 }
 
 func pushTool() mcp.Tool {
 	return mcp.NewTool("notion_push",
-		mcp.WithDescription("Push a local markdown file to Notion. Uses efficient erase+replace (not block-by-block deletion). File must have notion_id in frontmatter."),
+		mcp.WithDescription("Push a local markdown file to Notion. Uses efficient erase+replace (not block-by-block deletion). File must have notion_id in frontmatter. If scope is provided, converts relative .md links to notion:// links before pushing."),
 		mcp.WithString("file_path",
 			mcp.Required(),
 			mcp.Description("Path to the local markdown file (must have notion_id in frontmatter)"),
+		),
+		mcp.WithString("scope",
+			mcp.Description("Directory to scan for .md files with notion_id frontmatter. If provided, enables link rewriting from relative paths to notion:// links."),
+		),
+		mcp.WithBoolean("recursive",
+			mcp.Description("Whether to scan scope directory recursively. Default: true"),
 		),
 	)
 }
@@ -96,6 +118,11 @@ func pushTool() mcp.Tool {
 func handlePush(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, _ := req.Params.Arguments.(map[string]any)
 	filePath, _ := args["file_path"].(string)
+	scope, _ := args["scope"].(string)
+	recursive := true // default
+	if r, ok := args["recursive"].(bool); ok {
+		recursive = r
+	}
 
 	if filePath == "" {
 		return mcp.NewToolResultError("file_path is required"), nil
@@ -106,7 +133,7 @@ func handlePush(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 		return mcp.NewToolResultError(fmt.Sprintf("failed to create client: %v", err)), nil
 	}
 
-	if err := client.PushPage(filePath); err != nil {
+	if err := client.PushPageWithScope(filePath, scope, recursive); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to push page: %v", err)), nil
 	}
 

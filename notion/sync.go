@@ -89,15 +89,25 @@ type Comment struct {
 
 // PullResult contains the result of pulling a page.
 type PullResult struct {
-	Markdown   string
-	FilePath   string
-	PageID     string
-	Title      string
-	ChildPages []string // IDs of child pages for restoration
+	Markdown       string
+	FilePath       string
+	PageID         string
+	Title          string
+	ChildPages     []string // IDs of child pages for restoration
+	RewrittenLinks int      // Number of notion:// links rewritten to relative paths
+	FilesUpdated   int      // Number of other files updated with relative links
 }
 
 // PullPage fetches a Notion page with comments and saves as markdown.
+// This is the basic version without link rewriting. Use PullPageWithScope for full functionality.
 func (c *Client) PullPage(pageID string, outputDir string) (*PullResult, error) {
+	return c.PullPageWithScope(pageID, outputDir, "", true)
+}
+
+// PullPageWithScope fetches a Notion page and saves as markdown, with link rewriting.
+// If scope is provided, it scans for .md files with notion_id and rewrites notion:// links
+// to relative paths where local copies exist. Also updates other files in scope.
+func (c *Client) PullPageWithScope(pageID string, outputDir string, scope string, recursive bool) (*PullResult, error) {
 	pageID = strings.ReplaceAll(pageID, "-", "")
 
 	title, err := c.getPageTitle(pageID)
@@ -186,20 +196,90 @@ func (c *Client) PullPage(pageID string, outputDir string) (*PullResult, error) 
 		return nil, fmt.Errorf("failed to write file: %w", err)
 	}
 
-	return &PullResult{
+	result := &PullResult{
 		Markdown:   content,
 		FilePath:   filePath,
 		PageID:     pageID,
 		Title:      title,
 		ChildPages: childPageIDs,
-	}, nil
+	}
+
+	// Link rewriting: if scope is provided, rewrite notion:// links to relative paths
+	if scope != "" {
+		debugLog("PullPageWithScope: scanning scope %s (recursive=%v)", scope, recursive)
+
+		// Build map of notion_id -> filepath for all .md files in scope
+		idToPath, err := ScanForNotionIDs(scope, recursive)
+		if err != nil {
+			debugLog("PullPageWithScope: failed to scan scope: %v", err)
+			// Don't fail the pull, just skip link rewriting
+			return result, nil
+		}
+
+		// Add the newly pulled file to the map
+		idToPath[pageID] = filePath
+		debugLog("PullPageWithScope: found %d files with notion_id", len(idToPath))
+
+		// Rewrite the pulled file
+		rewrittenContent := RewriteNotionLinksToRelative(content, idToPath, filePath)
+		if rewrittenContent != content {
+			if err := os.WriteFile(filePath, []byte(rewrittenContent), 0644); err != nil {
+				debugLog("PullPageWithScope: failed to rewrite pulled file: %v", err)
+			} else {
+				result.Markdown = rewrittenContent
+				result.RewrittenLinks = countLinkDifferences(content, rewrittenContent)
+				debugLog("PullPageWithScope: rewrote %d links in pulled file", result.RewrittenLinks)
+			}
+		}
+
+		// Rewrite all other files in scope that reference this newly pulled page
+		filesUpdated := 0
+		for id, path := range idToPath {
+			if id == pageID {
+				continue // Skip the file we just pulled
+			}
+			fileContent, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			newContent := RewriteNotionLinksToRelative(string(fileContent), idToPath, path)
+			if newContent != string(fileContent) {
+				if err := os.WriteFile(path, []byte(newContent), 0644); err == nil {
+					filesUpdated++
+					debugLog("PullPageWithScope: updated links in %s", path)
+				}
+			}
+		}
+		result.FilesUpdated = filesUpdated
+	}
+
+	return result, nil
+}
+
+// countLinkDifferences counts how many links were changed between old and new content.
+func countLinkDifferences(old, new string) int {
+	// Simple heuristic: count notion:// occurrences in old minus new
+	oldCount := strings.Count(old, "notion://")
+	newCount := strings.Count(new, "notion://")
+	if oldCount > newCount {
+		return oldCount - newCount
+	}
+	return 0
 }
 
 // PushPage reads a markdown file and pushes to Notion.
+// This is the basic version without link rewriting. Use PushPageWithScope for full functionality.
+func (c *Client) PushPage(filePath string) error {
+	return c.PushPageWithScope(filePath, "", true)
+}
+
+// PushPageWithScope reads a markdown file and pushes to Notion, with link rewriting.
+// If scope is provided, it scans for .md files with notion_id and converts relative .md links
+// to notion://UUID links before pushing.
 // Child pages tracked in frontmatter are re-parented after the push
 // so they appear at the bottom of the page.
-func (c *Client) PushPage(filePath string) error {
-	debugLog("PushPage: reading %s", filePath)
+func (c *Client) PushPageWithScope(filePath string, scope string, recursive bool) error {
+	debugLog("PushPageWithScope: reading %s", filePath)
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
@@ -209,7 +289,29 @@ func (c *Client) PushPage(filePath string) error {
 	if pageID == "" {
 		return fmt.Errorf("no notion_id found in frontmatter")
 	}
-	debugLog("PushPage: page_id=%s, content_len=%d, child_pages=%d", pageID, len(markdown), len(childPageIDs))
+	debugLog("PushPageWithScope: page_id=%s, content_len=%d, child_pages=%d", pageID, len(markdown), len(childPageIDs))
+
+	// Link rewriting: if scope is provided, convert relative .md links to notion:// links
+	if scope != "" {
+		debugLog("PushPageWithScope: scanning scope %s (recursive=%v)", scope, recursive)
+
+		// Build map of filepath -> notion_id for all .md files in scope
+		idToPath, err := ScanForNotionIDs(scope, recursive)
+		if err != nil {
+			debugLog("PushPageWithScope: failed to scan scope: %v", err)
+			// Continue without link rewriting
+		} else {
+			// Invert the map to pathToID
+			pathToID := make(map[string]string)
+			for id, path := range idToPath {
+				pathToID[path] = id
+			}
+			debugLog("PushPageWithScope: found %d files with notion_id", len(pathToID))
+
+			// Rewrite relative links to notion:// links
+			markdown = RewriteRelativeLinksToNotion(markdown, pathToID, filePath)
+		}
+	}
 
 	markdown, preservedComments := extractCommentsSection(markdown)
 
@@ -1008,4 +1110,170 @@ func extractRichText(v any) string {
 		}
 	}
 	return text.String()
+}
+
+// ScanForNotionIDs scans a directory for .md files with notion_id in frontmatter.
+// Returns a map of notion_id -> filepath.
+func ScanForNotionIDs(dir string, recursive bool) (map[string]string, error) {
+	result := make(map[string]string)
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+		if info.IsDir() {
+			if !recursive && path != dir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(path), ".md") {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil // Skip unreadable files
+		}
+
+		pageID, _ := parseFrontmatter(string(content))
+		if pageID != "" {
+			// Normalize page ID (remove dashes)
+			pageID = strings.ReplaceAll(pageID, "-", "")
+			result[pageID] = path
+		}
+		return nil
+	}
+
+	if err := filepath.Walk(dir, walkFn); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// RewriteNotionLinksToRelative converts notion://UUID links to relative paths.
+// The idToPath map contains normalized (no dashes) page IDs to local file paths.
+// relativeTo is the file being rewritten (used to compute relative paths).
+func RewriteNotionLinksToRelative(content string, idToPath map[string]string, relativeTo string) string {
+	// Pattern: [@Title](notion://UUID) or [text](notion://UUID)
+	linkPattern := regexp.MustCompile(`\[([^\]]+)\]\(notion://([a-f0-9-]+)\)`)
+
+	return linkPattern.ReplaceAllStringFunc(content, func(match string) string {
+		parts := linkPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		linkText := parts[1]
+		pageID := strings.ReplaceAll(parts[2], "-", "") // Normalize
+
+		localPath, ok := idToPath[pageID]
+		if !ok {
+			return match // Keep original if not found locally
+		}
+
+		// Compute relative path from relativeTo to localPath
+		relPath, err := computeRelativePath(relativeTo, localPath)
+		if err != nil {
+			return match
+		}
+
+		// If it was a mention link (starts with @), strip the @ for normal link
+		if strings.HasPrefix(linkText, "@") {
+			linkText = strings.TrimPrefix(linkText, "@")
+		}
+
+		return fmt.Sprintf("[%s](%s)", linkText, relPath)
+	})
+}
+
+// RewriteRelativeLinksToNotion converts relative .md links to notion://UUID links.
+// The pathToID map contains absolute file paths to notion_id.
+// relativeTo is the file being rewritten (used to resolve relative paths).
+func RewriteRelativeLinksToNotion(content string, pathToID map[string]string, relativeTo string) string {
+	// Pattern: [text](path.md) or [text](./path.md) or [text](../path.md)
+	linkPattern := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+\.md)\)`)
+
+	relativeDir := filepath.Dir(relativeTo)
+
+	return linkPattern.ReplaceAllStringFunc(content, func(match string) string {
+		parts := linkPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		linkText := parts[1]
+		linkPath := parts[2]
+
+		// Skip if it's already a notion:// link
+		if strings.HasPrefix(linkPath, "notion://") {
+			return match
+		}
+
+		// Resolve to absolute path
+		var absPath string
+		if filepath.IsAbs(linkPath) {
+			absPath = linkPath
+		} else {
+			absPath = filepath.Join(relativeDir, linkPath)
+		}
+		absPath = filepath.Clean(absPath)
+
+		pageID, ok := pathToID[absPath]
+		if !ok {
+			return match // Keep original if not found
+		}
+
+		// Convert to mention format: [@Title](notion://UUID)
+		return fmt.Sprintf("[@%s](notion://%s)", linkText, pageID)
+	})
+}
+
+// computeRelativePath computes the relative path from 'from' to 'to'.
+// Both paths should be absolute.
+func computeRelativePath(from, to string) (string, error) {
+	fromDir := filepath.Dir(from)
+	relPath, err := filepath.Rel(fromDir, to)
+	if err != nil {
+		return "", err
+	}
+	// Ensure forward slashes for markdown compatibility
+	relPath = filepath.ToSlash(relPath)
+	return relPath, nil
+}
+
+// RewriteLinksInFile reads a file, rewrites notion:// links to relative paths, and saves.
+func RewriteLinksInFile(filePath string, idToPath map[string]string) error {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	newContent := RewriteNotionLinksToRelative(string(content), idToPath, filePath)
+
+	if newContent != string(content) {
+		debugLog("RewriteLinksInFile: updating %s", filePath)
+		return os.WriteFile(filePath, []byte(newContent), 0644)
+	}
+	return nil
+}
+
+// RewriteAllLinksInScope rewrites notion:// links in all .md files in scope.
+func RewriteAllLinksInScope(scope string, recursive bool, idToPath map[string]string) error {
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			if !recursive && path != scope {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(path), ".md") {
+			return nil
+		}
+
+		return RewriteLinksInFile(path, idToPath)
+	}
+
+	return filepath.Walk(scope, walkFn)
 }
